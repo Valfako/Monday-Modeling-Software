@@ -1,0 +1,102 @@
+sequenceDiagram
+    autonumber
+    actor Comp as Industria Compradora
+    participant Web as Aplicacao Web
+    participant LB as API Gateway / Load Balancer
+    participant API as API Core
+    participant DB as Banco Transacional
+    participant Q as Fila de Eventos
+    participant W as Worker de Integracoes
+    participant GW as Gateway de Pagamento e Escrow
+    participant SINIR as SINIR / MTR Digital
+    participant Mail as Servico de Notificacoes
+
+    Comp->>Web: Confirma acordo (Pronto para Liquidacao)
+    Web->>LB: POST /transacoes/{id}/concluir (UC10)
+    LB->>API: Encaminha requisicao
+
+    Note over API,DB: Falha 1 - banco lento (timeout de 3s)
+    API->>DB: Grava Transacao PENDENTE e evento Outbox (mesma transacao)
+    alt Banco responde em ate 3s
+        DB-->>API: Commit OK
+        API-->>LB: 202 Accepted
+        LB-->>Web: 202 Accepted
+        Web-->>Comp: Pagamento em processamento
+    else Banco excede 3s
+        DB--xAPI: Sem resposta em 3s
+        API->>API: Circuit breaker registra falha
+        alt Circuito fechado
+            API->>DB: Retry 1x apos 500 ms com a mesma Idempotency-Key
+            alt Retry bem-sucedido
+                DB-->>API: Commit OK
+                API-->>LB: 202 Accepted
+                LB-->>Web: 202 Accepted
+                Web-->>Comp: Pagamento em processamento
+            else Retry tambem falha
+                API-->>LB: 503 + Retry-After
+                LB-->>Web: 503 Service Unavailable
+                Web-->>Comp: Tente novamente em instantes
+            end
+        else Circuito aberto
+            API-->>LB: 503 imediato (fail fast)
+            LB-->>Web: 503 Service Unavailable
+            Web-->>Comp: Servico temporariamente indisponivel
+        end
+    end
+    Note over API,Q: Em todo commit bem-sucedido o relay Outbox publica o evento
+    API->>Q: Publica PagamentoSolicitado
+
+    Note over Q,GW: UC11 (Escrow) e UC12 (MTR) de forma assincrona
+    Q->>W: Entrega PagamentoSolicitado
+    W->>GW: Retem valor em Escrow (Idempotency-Key)
+    GW-->>W: escrowId e valorRetido
+    W->>DB: Transacao = PAGAMENTO_CUSTODIADO
+    W->>SINIR: Gera e vincula MTR Digital
+    SINIR-->>W: codigoMTR
+    W->>DB: Grava codigoMTR
+    W->>Q: Publica TransacaoCustodiada
+
+    Note over Q,Mail: Falha 2 - servico de e-mail indisponivel
+    Q->>W: Entrega NotificarCompradoraEVendedora
+    W->>Mail: Envia e-mail de pagamento custodiado
+    alt Notificacao enviada
+        Mail-->>W: 200 OK
+        W->>Q: ACK da mensagem
+    else Servico de e-mail indisponivel
+        Mail--xW: Erro 5xx ou timeout
+        W->>Q: NACK e reenfileira em fila de retry (30s, 2min, 10min)
+        loop Ate 3 tentativas
+            Q->>W: Reentrega apos atraso
+            W->>Mail: Reenvia e-mail
+            alt Voltou a responder
+                Mail-->>W: 200 OK
+                W->>Q: ACK e encerra retentativas
+            else Continua indisponivel
+                Mail--xW: Erro
+                W->>Q: NACK com proximo backoff
+            end
+        end
+        opt Tentativas esgotadas
+            W->>Q: Move para notificacao-dlq
+            W->>DB: Marca notificacao como PENDENTE_REENVIO
+            Note over W,Q: Alerta ao SRE. Pagamento e MTR nao sao afetados
+        end
+    end
+
+    Note over Comp,GW: Liberacao apos o ateste de recebimento
+    Comp->>Web: Atesta recebimento do lote
+    Web->>LB: POST /transacoes/{id}/atestar
+    LB->>API: Encaminha requisicao
+    API->>DB: Registra ateste e evento Outbox
+    API->>Q: Publica LiberarEscrow
+    Q->>W: Entrega LiberarEscrow
+    W->>GW: Libera Escrow (escrowId)
+    GW-->>W: 202 repasse em processamento
+
+    Note over GW,API: Webhook entra pela API Core, nunca direto na fila
+    GW->>LB: Webhook repasse confirmado
+    LB->>API: Encaminha webhook
+    API->>API: Valida assinatura e descarta duplicata
+    API->>Q: Publica RepasseConfirmado
+    Q->>W: Entrega RepasseConfirmado
+    W->>DB: Transacao = CONCLUIDA

@@ -1,0 +1,165 @@
+classDiagram
+    direction TB
+
+    class Usuario {
+        <<abstract>>
+        -Long id
+        -String email
+        -String senhaHash
+        +autenticar(senha String) Boolean
+    }
+    class Empresa {
+        -String cnpj
+        -String razaoSocial
+        -String cnaePrincipal
+        +criarOferta(dados DadosOferta) Oferta
+        +demonstrarInteresse(oferta Oferta) Interesse
+    }
+    class Administrador {
+        -String matricula
+        +aprovarOferta(oferta Oferta) void
+        +auditarLicenca(licenca LicencaAmbiental) void
+    }
+    class Endereco
+    class LicencaAmbiental {
+        -String numero
+        -LocalDate validade
+        +estaVigente() Boolean
+    }
+    class Material {
+        -String nome
+        -String classeNbr10004
+        -String codigoIbama
+    }
+    class Oferta {
+        -Long id
+        -StatusOferta status
+        -Boolean aceitaPermuta
+        +publicar() void
+        +pausar() void
+    }
+    class Negociacao {
+        -Long id
+        -StatusNegociacao status
+        +contrapropor(valor BigDecimal) void
+        +aceitar() Transacao
+    }
+    class Transacao {
+        -Long id
+        -String codigoMtr
+        -StatusTransacao status
+        +confirmarCustodia(escrowId String) void
+        +vincularMtr(codigo String) void
+        +atestarRecebimento() void
+        +concluir() void
+    }
+    class Pagamento {
+        -String escrowIdGateway
+        -BigDecimal valor
+        -FormaPagamento forma
+        -StatusPagamento status
+        +registrarCustodia(escrowId String) void
+        +registrarLiberacao() void
+    }
+
+    Usuario <|-- Empresa
+    Usuario <|-- Administrador
+    Empresa *-- "1" Endereco : composicao
+    Empresa *-- "1..*" LicencaAmbiental : composicao
+    Oferta o-- "1..*" Material : agregacao
+    Empresa "1" --> "0..*" Oferta : publica
+    Oferta "1" --> "0..*" Negociacao
+    Negociacao "1" --> "0..1" Transacao
+    Transacao *-- "1" Pagamento : composicao
+
+    class PagamentoGatewayPort {
+        <<interface>>
+        +reter(cmd RetencaoCmd) EscrowResultado
+        +liberar(escrowId String, chave String) void
+    }
+    class MtrPort {
+        <<interface>>
+        +emitir(lote LoteMtrDados) String
+    }
+    class ConsultaCnpjPort {
+        <<interface>>
+        +consultar(cnpj String) DadosCadastrais
+    }
+    class NotificacaoPort {
+        <<interface>>
+        +enviar(msg Mensagem) void
+    }
+    class EventoPublisherPort {
+        <<interface>>
+        +publicar(evento EventoDominio) void
+    }
+    class TransacaoRepository {
+        <<interface>>
+        +buscarPorId(id Long) Transacao
+        +salvar(t Transacao) Transacao
+    }
+
+    class PagamentoGatewayRestAdapter
+    class SinirMtrRestAdapter
+    class ReceitaCnpjRestAdapter
+    class NotificacaoAdapter
+    class OutboxEventoPublisher
+    class TransacaoJpaRepository
+
+    PagamentoGatewayRestAdapter ..|> PagamentoGatewayPort
+    SinirMtrRestAdapter ..|> MtrPort
+    ReceitaCnpjRestAdapter ..|> ConsultaCnpjPort
+    NotificacaoAdapter ..|> NotificacaoPort
+    OutboxEventoPublisher ..|> EventoPublisherPort
+    TransacaoJpaRepository ..|> TransacaoRepository
+
+    class ConcluirTransacaoService {
+        <<service>>
+        -TransacaoRepository repo
+        -EventoPublisherPort eventos
+        +concluir(transacaoId Long) EscrowRetidoResponseDTO
+    }
+    class ProcessarPagamentoEscrowService {
+        <<service>>
+        -PagamentoGatewayPort gateway
+        -TransacaoRepository repo
+        -EventoPublisherPort eventos
+        +processar(evento PagamentoSolicitado) void
+    }
+    class EmitirMtrService {
+        <<service>>
+        -MtrPort mtr
+        -TransacaoRepository repo
+        +emitir(evento TransacaoCustodiada) void
+    }
+    class CadastrarEmpresaService {
+        <<service>>
+        -ConsultaCnpjPort receita
+        +cadastrar(dados DadosEmpresa) Empresa
+    }
+    class EscrowRetidoMapper {
+        +toDto(t Transacao) EscrowRetidoResponseDTO
+    }
+    class EscrowRetidoResponseDTO {
+        <<record>>
+        Long transacaoId
+        String codigoLote
+        String escrowIdGateway
+        BigDecimal valorRetido
+        BigDecimal taxaPlataforma
+        FormaPagamento forma
+        StatusTransacao status
+        Instant retidoEm
+    }
+
+    ConcluirTransacaoService ..> TransacaoRepository : injecao por construtor
+    ConcluirTransacaoService ..> EventoPublisherPort : injecao por construtor
+    ConcluirTransacaoService ..> EscrowRetidoMapper
+    ProcessarPagamentoEscrowService ..> PagamentoGatewayPort : injecao por construtor
+    ProcessarPagamentoEscrowService ..> TransacaoRepository : injecao por construtor
+    ProcessarPagamentoEscrowService ..> EventoPublisherPort : injecao por construtor
+    EmitirMtrService ..> MtrPort : injecao por construtor
+    EmitirMtrService ..> TransacaoRepository : injecao por construtor
+    CadastrarEmpresaService ..> ConsultaCnpjPort : injecao por construtor
+    EscrowRetidoMapper ..> EscrowRetidoResponseDTO : cria
+    ProcessarPagamentoEscrowService ..> Transacao : atualiza estado

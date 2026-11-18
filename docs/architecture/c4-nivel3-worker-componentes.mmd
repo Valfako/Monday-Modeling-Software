@@ -1,0 +1,35 @@
+C4Component
+title Worker de Integracoes - Componentes (C4 Nivel 3)
+
+ContainerQueue(fila, "Fila de Eventos", "RabbitMQ", "Eventos e filas de retry")
+ContainerDb(db, "Banco Transacional", "PostgreSQL + PostGIS", "Transacoes e Outbox")
+System_Ext(gateway, "Gateway de Pagamento e Escrow", "Escrow Pix/Boleto")
+System_Ext(sinir, "SINIR / MTR Digital", "Manifesto de transporte")
+System_Ext(notif, "Servico de Notificacoes", "E-mail, WhatsApp e SMS")
+
+Container_Boundary(worker, "Worker de Integracoes") {
+    Component(listener, "EventoListener", "Spring AMQP", "Consome eventos, aplica idempotencia e ACK/NACK")
+    Component(escrowUC, "ProcessarPagamentoEscrowService", "Servico de aplicacao", "UC11. Depende da PagamentoGatewayPort")
+    Component(mtrUC, "EmitirMtrService", "Servico de aplicacao", "UC12. Depende da MtrPort")
+    Component(notifUC, "EnviarNotificacaoService", "Servico de aplicacao", "Depende da NotificacaoPort")
+    Component(gwAdp, "PagamentoGatewayRestAdapter", "Adaptador", "Implementa PagamentoGatewayPort")
+    Component(mtrAdp, "SinirMtrRestAdapter", "Adaptador", "Implementa MtrPort")
+    Component(notifAdp, "NotificacaoAdapter", "Adaptador", "Implementa NotificacaoPort")
+    Component(repoAdp, "TransacaoJpaRepository", "Spring Data JPA", "Implementa TransacaoRepository")
+}
+
+Rel(fila, listener, "Entrega eventos", "AMQP")
+Rel(listener, escrowUC, "Despacha PagamentoSolicitado e LiberarEscrow")
+Rel(listener, mtrUC, "Despacha TransacaoCustodiada")
+Rel(listener, notifUC, "Despacha NotificarCompradoraEVendedora")
+
+Rel(escrowUC, gwAdp, "Usa via PagamentoGatewayPort", "Injecao por construtor")
+Rel(mtrUC, mtrAdp, "Usa via MtrPort", "Injecao por construtor")
+Rel(notifUC, notifAdp, "Usa via NotificacaoPort", "Injecao por construtor")
+Rel(escrowUC, repoAdp, "Usa via TransacaoRepository", "Injecao por construtor")
+Rel(mtrUC, repoAdp, "Usa via TransacaoRepository", "Injecao por construtor")
+
+Rel(gwAdp, gateway, "Retem e libera Escrow", "REST / HTTPS")
+Rel(mtrAdp, sinir, "Gera e vincula MTR", "REST / JSON")
+Rel(notifAdp, notif, "Envia alertas", "REST / HTTPS")
+Rel(repoAdp, db, "Le e grava", "JDBC")

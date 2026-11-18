@@ -1,0 +1,43 @@
+C4Container
+title Marketplace B2B de Sobras Industriais - Containers (C4 Nivel 2)
+
+Person(vendedora, "Industria Vendedora", "Publica lotes, anexa laudos e despacha o material")
+Person(compradora, "Industria Compradora", "Filtra anuncios, contrapropoe e recebe o lote")
+Person(admin, "Administrador", "Audita licencas e modera anuncios")
+
+System_Boundary(mkt, "Marketplace B2B de Sobras") {
+    Container(web, "Aplicacao Web", "Next.js", "Portal de catalogo, negociacao e painel administrativo")
+    Container(lb, "API Gateway / Load Balancer", "Nginx", "Roteamento, TLS, rate limit e balanceamento entre replicas")
+    Container(api, "API Core", "Spring Boot (replicas)", "Ofertas, negociacao, transacao e regras de dominio. Recebe webhooks e retorna apenas DTOs")
+    Container(worker, "Worker de Integracoes", "Spring Boot", "Consome eventos: Escrow, MTR Digital, CNPJ e notificacoes. Idempotente")
+    ContainerQueue(fila, "Fila de Eventos", "RabbitMQ", "Eventos do padrao Outbox, retry com backoff e DLQ")
+    ContainerDb(db, "Banco Transacional", "PostgreSQL + PostGIS", "Empresas, ofertas, negociacoes, transacoes e Outbox. Primario + replica de leitura")
+    ContainerDb(cache, "Cache", "Redis", "Cache de catalogo, filtros e sessoes")
+    ContainerDb(storage, "Armazenamento de Arquivos", "Object Storage S3", "Laudos, FDS e fotos dos lotes")
+}
+
+System_Ext(gateway, "Gateway de Pagamento e Escrow", "Cobranca Pix/Boleto e custodia ate a entrega")
+System_Ext(sinir, "SINIR / MTR Digital", "Valida destinacao e emite o manifesto de transporte")
+System_Ext(receita, "Receita Federal / API CNPJ", "Valida CNPJ, CNAE e endereco fiscal")
+System_Ext(notif, "Servico de Notificacoes", "E-mail, WhatsApp e SMS")
+
+Rel(vendedora, web, "Publica lotes e negocia", "HTTPS")
+Rel(compradora, web, "Busca ofertas e negocia", "HTTPS")
+Rel(admin, web, "Modera e audita", "HTTPS")
+
+Rel(web, lb, "Chama a API", "HTTPS / JSON")
+Rel(lb, api, "Encaminha requisicoes", "HTTP")
+
+Rel(api, db, "Le e grava (escrita no primario, leitura na replica)", "JDBC")
+Rel(api, cache, "Consulta catalogo em cache", "RESP")
+Rel(api, storage, "Envia e le anexos via URL pre-assinada", "HTTPS")
+Rel(api, fila, "Publica eventos via Outbox", "AMQP")
+
+Rel(fila, worker, "Entrega eventos", "AMQP")
+Rel(worker, db, "Atualiza status da saga", "JDBC")
+Rel(worker, gateway, "Retem e libera Escrow", "REST / HTTPS")
+Rel(worker, sinir, "Gera e vincula MTR", "REST / JSON")
+Rel(worker, receita, "Valida CNPJ e CNAE", "REST / HTTPS")
+Rel(worker, notif, "Envia alertas", "REST / HTTPS")
+
+Rel(gateway, lb, "Webhook de confirmacao", "HTTPS")

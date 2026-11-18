@@ -1,0 +1,79 @@
+# ADR-001: Adoção do RabbitMQ para mensageria assíncrona
+
+| Campo | Valor |
+|---|---|
+| **Projeto** | Marketplace B2B de Sobras Industriais (Grupo BTM) |
+| **Status** | Aceito |
+| **Data** | 17/11/2026 |
+| **Decisores** | Kauan Oliveira, Vitor Silva, João Gabriel, Yudi |
+| **Relacionado a** | UC10 (Concluir Transação B2B), UC11 (Processar Pagamento em Escrow), UC12 (Emitir e Vincular MTR Digital), RF12 |
+
+---
+
+## Contexto
+
+O marketplace depende de quatro sistemas externos: Gateway de Pagamento com Escrow, SINIR/MTR Digital, Receita Federal (API CNPJ) e Serviço de Notificações. Todos são sujeitos a lentidão, indisponibilidade e reentrega de webhooks, e nenhum está sob o nosso controle.
+
+O fluxo de conclusão de transação (UC10) inclui o Escrow (UC11) e o MTR (UC12). Na prática, ele é uma **saga** de múltiplas etapas: `Pagamento Custodiado` → `MTR emitido` → `Liberação após o ateste de recebimento`. Se essas chamadas forem síncronas dentro da API Core, ocorrem os seguintes problemas:
+
+- A indisponibilidade de um terceiro trava a requisição do usuário e bloqueia UC03 e UC10.
+- A API Core fica acoplada ao ciclo de vida do pagamento, inclusive aos webhooks do gateway.
+- Não há retentativa controlada, o que arrisca pagamentos duplicados ou liberações perdidas.
+- Falhas parciais (pagamento retido, mas MTR não gerado) deixam a transação em estado inconsistente.
+
+Requisitos que motivam a decisão:
+
+1. Desacoplar a API Core das integrações externas (eliminar pontos de falha única).
+2. Garantir entrega confiável de eventos financeiros e regulatórios, sem perda.
+3. Permitir retentativas com backoff e tratamento de mensagens venenosas (DLQ).
+4. Suportar processamento idempotente de webhooks e comandos.
+5. Operar com baixa complexidade para uma equipe pequena. O volume esperado é moderado, característico de B2B em um polo industrial (CIC), e não de streaming de alto throughput.
+
+## Decisão
+
+Adotaremos o **RabbitMQ** (protocolo AMQP 0-9-1) como broker de mensageria assíncrona entre a **API Core (Spring Boot)** e o **Worker de Integrações**.
+
+Diretrizes de implementação:
+
+- **Padrão Outbox:** a API grava o evento na tabela `outbox` na mesma transação do PostgreSQL que altera o estado de negócio. Um publicador envia os eventos ao RabbitMQ, evitando o *dual write*.
+- **Topologia:** *exchange* do tipo `topic` (ex.: `marketplace.eventos`) com filas duráveis por responsabilidade: `pagamento.solicitado`, `mtr.gerar`, `escrow.liberar`, `notificacao.enviar`, `cnpj.validar`.
+- **Confiabilidade:** filas *quorum*, mensagens persistentes, *publisher confirms* e *ack* manual no consumidor.
+- **Retentativas:** filas de retry com TTL e *dead-letter exchange* (backoff de 30 s, 2 min e 10 min), com no máximo 3 tentativas.
+- **DLQ:** mensagens esgotadas vão para filas `*-dlq`, com alerta ao time de operação e marcação do registro como `PENDENTE_REENVIO`.
+- **Idempotência:** toda mensagem carrega `Idempotency-Key` e `correlationId`. Os consumidores descartam duplicatas, e as chamadas ao Gateway e ao SINIR reutilizam a mesma chave.
+- **Webhooks do gateway:** o endpoint da API apenas valida a assinatura, registra e publica na fila, respondendo rápido. O processamento ocorre no Worker.
+- **Contratos:** as mensagens são versionadas (`v1`) e usam DTOs, nunca entidades de domínio.
+
+Alternativas consideradas:
+
+| Alternativa | Motivo da rejeição |
+|---|---|
+| Chamadas síncronas diretas (REST) | Mantém o acoplamento temporal e propaga falhas de terceiros ao usuário. |
+| Apache Kafka | Superdimensionado para o volume previsto. Maior custo operacional (cluster, particionamento) e sem roteamento nem retry por TTL nativos. |
+| Amazon SQS/SNS | Bom encaixe técnico, mas gera dependência de fornecedor de nuvem ainda não definido e dificulta o desenvolvimento local. |
+| Redis Streams | Garantias de durabilidade e DLQ menos maduras. O Redis está previsto apenas como cache. |
+| Polling na tabela Outbox sem broker | Simples, porém escala mal, aumenta a carga no PostgreSQL e não oferece roteamento. |
+
+## Consequências Positivas
+
+- **Resiliência:** a queda do Gateway, do SINIR ou do e-mail não derruba a API. A API responde `202 Accepted` e o Worker conclui o trabalho depois.
+- **Desacoplamento:** o ciclo de pagamento e MTR passa a evoluir de forma independente do fluxo de negociação, e novos consumidores (ex.: auditoria) entram sem alterar a API.
+- **Entrega confiável:** Outbox, *publisher confirms* e *ack* manual reduzem o risco de perder eventos de Escrow ou MTR.
+- **Retentativa e observabilidade de falhas:** backoff e DLQ dão tratamento padronizado a erros transitórios e visibilidade de falhas permanentes.
+- **Escalabilidade horizontal:** é possível adicionar réplicas do Worker consumindo a mesma fila.
+- **Maturidade e ecossistema:** suporte nativo no Spring Boot (Spring AMQP), painel de gestão embutido e curva de aprendizado baixa para a equipe.
+- **Roteamento flexível:** *exchanges* `topic` simplificam a separação por tipo de evento.
+
+## Consequências Negativas (Trade-offs)
+
+- **Consistência eventual:** o usuário vê "pagamento em processamento" em vez de resposta imediata. A interface e a máquina de estados da `Transacao` precisam refletir isso.
+- **Nova peça de infraestrutura:** o RabbitMQ passa a ser um componente crítico e, sem cluster, vira um novo SPOF. Exige cluster de pelo menos 3 nós, monitoramento e backup de definições.
+- **Complexidade operacional e de código:** é necessário implementar Outbox, idempotência, backoff e DLQ, além de testar cenários de falha. A depuração de fluxos distribuídos exige `correlationId` e *tracing*.
+- **Entrega *at-least-once*:** o broker pode reentregar mensagens, então todo consumidor deve ser idempotente. Falhas nesse ponto podem gerar cobranças ou liberações duplicadas.
+- **Ordenação limitada:** não há garantia global de ordem. Eventos da mesma transação precisam de controle por estado ou de uma fila serializada.
+- **Menor throughput que o Kafka:** sem retenção longa nem *replay* nativo de histórico. Se surgir necessidade de *event sourcing* ou analytics em larga escala, a decisão deverá ser revisitada.
+- **Custo adicional:** servidor(es) do broker e tempo de equipe para operação e capacitação.
+
+## Revisão
+
+Esta decisão deve ser reavaliada se o volume de eventos crescer em ordem de grandeza, se houver necessidade de *replay* de eventos ou se a operação do cluster se mostrar mais custosa que o benefício.
